@@ -1,5 +1,12 @@
 # OWASP Agent Memory Guard
 
+[![PyPI version](https://badge.fury.io/py/agent-memory-guard.svg)](https://badge.fury.io/py/agent-memory-guard)
+[![Downloads](https://pepy.tech/badge/agent-memory-guard)](https://pepy.tech/project/agent-memory-guard)
+[![Python Versions](https://img.shields.io/pypi/pyversions/agent-memory-guard.svg)](https://pypi.org/project/agent-memory-guard/)
+
+> **⭐ If you find this project useful for securing your AI agents, please consider giving it a star on GitHub! It helps others discover the project.**
+
+
 [![CI](https://github.com/OWASP/www-project-agent-memory-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/OWASP/www-project-agent-memory-guard/actions/workflows/ci.yml)
 [![PyPI version](https://img.shields.io/pypi/v/agent-memory-guard.svg)](https://pypi.org/project/agent-memory-guard/)
 [![PyPI downloads](https://img.shields.io/pypi/dm/agent-memory-guard.svg)](https://pepy.tech/project/agent-memory-guard)
