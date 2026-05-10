@@ -95,7 +95,110 @@ class Policy:
                 PolicyRule("quarantine_rapid_change", "rapid_change", Action.QUARANTINE),
             ],
         )
+    @classmethod
+    def tiered(cls) -> Policy:
+        """Pre-configured policy with default memory class taxonomy.
 
+        Memory classes:
+        - credentials.* : locked, block, 24h TTL
+        - permissions.* : locked, block, no decay
+        - policies.* : system-only, block, no decay
+        - facts.* : trusted, quarantine, 30d revalidation
+        - preferences.* : user-only, redact, 90d revalidation
+        - tool_results.* : untrusted, block + quarantine, 1h
+        - scratch.* : ephemeral, warn, session-bound
+        """
+        return cls(
+            default_action=Action.ALLOW,
+            protected_keys=(
+                "credentials.*",
+                "permissions.*",
+                "policies.*",
+                "facts.*",
+                "preferences.*",
+            ),
+            rules=[
+                # credentials.* — locked, block, 24h TTL
+                PolicyRule(
+                    "block_credential_injection",
+                    "prompt_injection",
+                    Action.BLOCK,
+                    keys=("credentials.*",),
+                ),
+                PolicyRule(
+                    "block_credential_sensitive",
+                    "sensitive_data",
+                    Action.BLOCK,
+                    keys=("credentials.*",),
+                ),
+                # permissions.* — locked, block
+                PolicyRule(
+                    "block_permission_injection",
+                    "prompt_injection",
+                    Action.BLOCK,
+                    keys=("permissions.*",),
+                ),
+                PolicyRule(
+                    "block_permission_sensitive",
+                    "sensitive_data",
+                    Action.BLOCK,
+                    keys=("permissions.*",),
+                ),
+                # policies.* — system-only, block
+                PolicyRule(
+                    "block_policy_injection",
+                    "prompt_injection",
+                    Action.BLOCK,
+                    keys=("policies.*",),
+                ),
+                # facts.* — trusted, quarantine
+                PolicyRule(
+                    "quarantine_fact_injection",
+                    "prompt_injection",
+                    Action.QUARANTINE,
+                    keys=("facts.*",),
+                ),
+                PolicyRule(
+                    "quarantine_fact_anomaly",
+                    "size_anomaly",
+                    Action.QUARANTINE,
+                    keys=("facts.*",),
+                ),
+                # preferences.* — user-only, redact
+                PolicyRule(
+                    "redact_preference_sensitive",
+                    "sensitive_data",
+                    Action.REDACT,
+                    keys=("preferences.*",),
+                ),
+                # tool_results.* — untrusted, block + quarantine
+                PolicyRule(
+                    "block_tool_result_injection",
+                    "prompt_injection",
+                    Action.BLOCK,
+                    keys=("tool_results.*",),
+                ),
+                PolicyRule(
+                    "quarantine_tool_result_anomaly",
+                    "size_anomaly",
+                    Action.QUARANTINE,
+                    keys=("tool_results.*",),
+                ),
+                # scratch.* — ephemeral, warn
+                PolicyRule(
+                    "quarantine_scratch_anomaly",
+                    "size_anomaly",
+                    Action.QUARANTINE,
+                    keys=("scratch.*",),
+                ),
+                # Global catch-all rules
+                PolicyRule("block_injection", "prompt_injection", Action.BLOCK),
+                PolicyRule("redact_secrets", "sensitive_data", Action.REDACT),
+                PolicyRule("block_protected_key", "protected_key", Action.BLOCK),
+                PolicyRule("quarantine_size_anomaly", "size_anomaly", Action.QUARANTINE),
+                PolicyRule("quarantine_rapid_change", "rapid_change", Action.QUARANTINE),
+            ],
+        )
 
 def _parse_action(value: Any) -> Action:
     if isinstance(value, Action):
