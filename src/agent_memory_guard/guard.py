@@ -5,16 +5,27 @@ import logging
 from collections.abc import Iterable
 from typing import Any, Callable
 
+from agent_memory_guard.classification import (
+    ClassificationRegistry,
+    MemoryClass,
+    PromotionRules,
+)
 from agent_memory_guard.detectors.anomaly import (
     RapidChangeDetector,
     SizeAnomalyDetector,
 )
 from agent_memory_guard.detectors.base import DetectionResult, Detector
+from agent_memory_guard.detectors.cross_task import CrossTaskContaminationDetector
 from agent_memory_guard.detectors.injection import PromptInjectionDetector
 from agent_memory_guard.detectors.leakage import SensitiveDataDetector
 from agent_memory_guard.detectors.protected_keys import ProtectedKeyDetector
-from agent_memory_guard.events import Action, SecurityEvent, Severity
-from agent_memory_guard.exceptions import IntegrityError, PolicyViolation
+from agent_memory_guard.detectors.self_reinforcement import SelfReinforcementDetector
+from agent_memory_guard.events import Action, SecurityEvent, Severity, SourceClass
+from agent_memory_guard.exceptions import (
+    ClassificationError,
+    IntegrityError,
+    PolicyViolation,
+)
 from agent_memory_guard.integrity import IntegrityRegistry, hash_value
 from agent_memory_guard.policies.policy import Policy, merge_protected_keys
 from agent_memory_guard.storage.memory_store import InMemoryStore, MemoryStore
@@ -43,6 +54,8 @@ class MemoryGuard:
         snapshots: SnapshotStore | None = None,
         event_handlers: Iterable[EventHandler] = (),
         snapshot_on_block: bool = True,
+        promotion_rules: PromotionRules | None = None,
+        current_task: str | None = None,
     ) -> None:
         self._store: MemoryStore = store if store is not None else InMemoryStore()
         self._policy = policy or Policy.permissive()
@@ -52,9 +65,16 @@ class MemoryGuard:
         self._events: list[SecurityEvent] = []
         self._snapshot_on_block = snapshot_on_block
         self._quarantine: dict[str, Any] = {}
+        self._classification = ClassificationRegistry()
+        self._promotion_rules = promotion_rules or PromotionRules()
+        self._current_task = current_task
 
         protected = merge_protected_keys(self._policy)
         self._protected_detector = ProtectedKeyDetector(protected)
+        self._cross_task_detector = CrossTaskContaminationDetector(
+            self._classification, current_task=current_task
+        )
+        self._self_reinforcement_detector = SelfReinforcementDetector()
 
         if detectors is None:
             self._detectors: list[Detector] = [
@@ -63,11 +83,28 @@ class MemoryGuard:
                 SizeAnomalyDetector(),
                 RapidChangeDetector(),
                 self._protected_detector,
+                self._cross_task_detector,
+                self._self_reinforcement_detector,
             ]
         else:
             self._detectors = list(detectors)
             if not any(isinstance(d, ProtectedKeyDetector) for d in self._detectors):
                 self._detectors.append(self._protected_detector)
+            if not any(
+                isinstance(d, CrossTaskContaminationDetector) for d in self._detectors
+            ):
+                self._detectors.append(self._cross_task_detector)
+            user_self_reinf = next(
+                (d for d in self._detectors if isinstance(d, SelfReinforcementDetector)),
+                None,
+            )
+            if user_self_reinf is None:
+                self._detectors.append(self._self_reinforcement_detector)
+            else:
+                # Reassign the canonical reference so `_pending_source_class`
+                # and `note_independent_write` operate on the detector that
+                # actually runs.
+                self._self_reinforcement_detector = user_self_reinf
 
         for key in self._policy.immutable_keys:
             if key in self._store:
@@ -113,10 +150,167 @@ class MemoryGuard:
                 drifted.append(key)
         return drifted
 
-    def write(self, key: str, value: Any, *, source: str = "agent") -> Action:
-        """Inspect and (if policy allows) commit a write. Returns the action taken."""
+    @property
+    def current_task(self) -> str | None:
+        return self._current_task
+
+    def set_current_task(self, task_id: str | None) -> None:
+        """Switch the task context used for cross-task contamination checks."""
+        self._current_task = task_id
+        self._cross_task_detector.set_current_task(task_id)
+
+    def classify(self, key: str) -> MemoryClass | None:
+        return self._classification.get(key)
+
+    def origin_task(self, key: str) -> str | None:
+        return self._classification.task_of(key)
+
+    def promote(
+        self,
+        key: str,
+        target: MemoryClass,
+        *,
+        verified: bool = False,
+        verified_by: str | None = None,
+    ) -> None:
+        """Move `key` to a new class. Enforces the promotion graph.
+
+        Promotions that `requires_verification` (e.g. user_preference_candidate
+        -> verified_preference) must pass `verified=True`. This is the user
+        opt-in step that prevents an ephemeral request from silently becoming
+        a durable preference.
+        """
+        current = self._classification.get(key)
+        if current is None:
+            raise ClassificationError(
+                f"Cannot promote unclassified key '{key}'",
+                key=key,
+                target_class=target.value,
+            )
+        if current == target:
+            return
+        edge = self._promotion_rules.edge(current, target)
+        if edge is None:
+            self._emit(
+                detector="classification",
+                severity=Severity.HIGH,
+                action=Action.BLOCK,
+                operation="promote",
+                key=key,
+                message=(
+                    f"Illegal promotion {current.value} -> {target.value} on '{key}'"
+                ),
+                metadata={"from": current.value, "to": target.value},
+            )
+            raise ClassificationError(
+                f"Promotion {current.value} -> {target.value} is not allowed",
+                key=key,
+                source_class=current.value,
+                target_class=target.value,
+            )
+        if edge.requires_verification and not verified:
+            self._emit(
+                detector="classification",
+                severity=Severity.HIGH,
+                action=Action.BLOCK,
+                operation="promote",
+                key=key,
+                message=(
+                    f"Promotion {current.value} -> {target.value} requires verification"
+                ),
+                metadata={"from": current.value, "to": target.value},
+            )
+            raise ClassificationError(
+                f"Promotion {current.value} -> {target.value} requires verified=True",
+                key=key,
+                source_class=current.value,
+                target_class=target.value,
+            )
+        self._classification.set(
+            key, target, task_id=self._classification.task_of(key)
+        )
+        self._emit(
+            detector="classification",
+            severity=Severity.INFO,
+            action=Action.ALLOW,
+            operation="promote",
+            key=key,
+            message=f"Promoted {current.value} -> {target.value}",
+            metadata={
+                "from": current.value,
+                "to": target.value,
+                "verified": verified,
+                "verified_by": verified_by,
+            },
+        )
+
+    def write(
+        self,
+        key: str,
+        value: Any,
+        *,
+        source: str = "agent",
+        source_class: SourceClass | str | None = None,
+        receipt_uri: str | None = None,
+        cls: MemoryClass | str | None = None,
+        task_id: str | None = None,
+    ) -> Action:
+        """Inspect and (if policy allows) commit a write. Returns the action taken.
+
+        Parameters
+        ----------
+        source_class
+            Provenance of this write — drives the self-reinforcement detector
+            and per-class telemetry. Use :class:`SourceClass.AGENT_AUTHORED`
+            for writes the agent generates from its own reasoning;
+            :class:`SourceClass.EXTERNAL_TOOL` for tool outputs;
+            :class:`SourceClass.USER_INPUT` for direct user content.
+        receipt_uri
+            Optional pointer into an external audit / receipt chain (e.g.
+            an Ed25519 co-signed receipt URI). Stored on the emitted
+            ``SecurityEvent`` so downstream SOC tooling can correlate
+            guard decisions with execution receipts.
+        cls
+            Provenance class for the entry (see :class:`MemoryClass`).
+        task_id
+            Override the task scope for this entry (defaults to the guard's
+            current task).
+        """
+        normalised_source_class: SourceClass = _coerce_source_class(source_class)
+
+        if cls is not None:
+            target_class = MemoryClass(cls) if not isinstance(cls, MemoryClass) else cls
+            existing = self._classification.get(key)
+            if existing is not None and existing != target_class:
+                self._emit(
+                    detector="classification",
+                    severity=Severity.HIGH,
+                    action=Action.BLOCK,
+                    operation="write",
+                    key=key,
+                    message=(
+                        f"Write would reclassify '{key}': {existing.value} -> "
+                        f"{target_class.value}; use promote() instead"
+                    ),
+                    metadata={"from": existing.value, "to": target_class.value},
+                    source_class=normalised_source_class,
+                    receipt_uri=receipt_uri,
+                )
+                raise ClassificationError(
+                    f"Cannot reclassify '{key}' on write; use promote()",
+                    key=key,
+                    source_class=existing.value,
+                    target_class=target_class.value,
+                )
+        else:
+            target_class = self._classification.get(key)
+
         committed_value = value
-        verdicts = self._run_detectors(key, value, operation="write")
+        self._self_reinforcement_detector._pending_source_class = normalised_source_class
+        try:
+            verdicts = self._run_detectors(key, value, operation="write")
+        finally:
+            self._self_reinforcement_detector._pending_source_class = SourceClass.UNKNOWN
         worst = _highest_severity(verdicts)
         decision = self._decide(verdicts, key=key)
 
@@ -129,6 +323,8 @@ class MemoryGuard:
                 key=key,
                 message=_combined_message(verdicts) or "Write blocked by policy",
                 metadata={"source": source},
+                source_class=normalised_source_class,
+                receipt_uri=receipt_uri,
             )
             if self._snapshot_on_block:
                 self._snapshots.capture(
@@ -148,6 +344,8 @@ class MemoryGuard:
                 key=key,
                 message="Write quarantined for review",
                 metadata={"source": source},
+                source_class=normalised_source_class,
+                receipt_uri=receipt_uri,
             )
             return Action.QUARANTINE
 
@@ -161,9 +359,25 @@ class MemoryGuard:
                 key=key,
                 message="Sensitive content redacted before write",
                 metadata={"source": source},
+                source_class=normalised_source_class,
+                receipt_uri=receipt_uri,
             )
 
         self._store.set(key, committed_value)
+
+        # Independent (non-agent-authored) writes reset the self-reinforcement
+        # cool-down: arrival of new external/user evidence is what breaks a
+        # self-poisoning loop.
+        if normalised_source_class != SourceClass.AGENT_AUTHORED:
+            self._self_reinforcement_detector.note_independent_write(key)
+
+        if target_class is not None:
+            existing_task = self._classification.task_of(key)
+            self._classification.set(
+                key,
+                target_class,
+                task_id=task_id if task_id is not None else existing_task or self._current_task,
+            )
 
         if key in self._policy.immutable_keys and not self._integrity.has_baseline(key):
             self._integrity.baseline(key, committed_value)
@@ -176,7 +390,9 @@ class MemoryGuard:
                 operation="write",
                 key=key,
                 message=_combined_message(verdicts) or "Write allowed with findings",
-                metadata={"source": source},
+                metadata={"source": source, **_merged_metadata(verdicts)},
+                source_class=normalised_source_class,
+                receipt_uri=receipt_uri,
             )
         return decision
 
@@ -235,7 +451,7 @@ class MemoryGuard:
                 operation="read",
                 key=key,
                 message=_combined_message(verdicts) or "Read allowed with findings",
-                metadata={"sink": sink},
+                metadata={"sink": sink, **_merged_metadata(verdicts)},
             )
         return value
 
@@ -252,6 +468,60 @@ class MemoryGuard:
             raise PolicyViolation(f"Delete of '{key}' blocked", key=key)
         self._store.delete(key)
         self._integrity.clear(key)
+        self._classification.clear(key)
+        self._self_reinforcement_detector.reset(key)
+
+    # ---- lifecycle governance ----------------------------------------
+
+    def retire_if(
+        self,
+        predicate: Callable[[str, Any], bool],
+        *,
+        reason: str = "lifecycle",
+    ) -> list[str]:
+        """Remove entries whose `predicate(key, value)` returns True.
+
+        Implements the lifecycle-governance pattern from the
+        microsoft/autogen#7683 thread: rather than silently expiring
+        memory on a wall-clock schedule, callers describe the condition
+        ("retire any `tool_observation` older than 1 hour", "retire any
+        entry tagged as low-confidence on next snapshot") and the guard
+        captures a forensic snapshot before removing them, so an operator
+        can roll back if the retirement turns out to have been premature.
+
+        Returns the list of keys that were retired. Skips protected keys
+        (raises no error — they remain in place).
+        """
+        snap = self._snapshots.capture(
+            self._dump_store(), label=f"pre-retire:{reason}"
+        )
+        retired: list[str] = []
+        for key, value in list(self._store.items()):
+            if self._protected_detector.matches(key):
+                continue
+            try:
+                should_retire = bool(predicate(key, value))
+            except Exception:
+                log.exception("retire_if predicate raised on key=%s", key)
+                continue
+            if not should_retire:
+                continue
+            self._store.delete(key)
+            self._integrity.clear(key)
+            self._classification.clear(key)
+            self._self_reinforcement_detector.reset(key)
+            retired.append(key)
+            self._emit(
+                detector="lifecycle",
+                severity=Severity.INFO,
+                action=Action.ALLOW,
+                operation="retire",
+                key=key,
+                message=f"Retired by lifecycle rule '{reason}'",
+                metadata={"reason": reason, "pre_snapshot_id": snap.snapshot_id},
+                source_class=SourceClass.SYSTEM,
+            )
+        return retired
 
     # ---- snapshots ----------------------------------------------------
 
@@ -328,6 +598,8 @@ class MemoryGuard:
         key: str,
         message: str,
         metadata: dict[str, Any] | None = None,
+        source_class: SourceClass = SourceClass.UNKNOWN,
+        receipt_uri: str | None = None,
     ) -> None:
         event = SecurityEvent(
             detector=detector,
@@ -336,6 +608,8 @@ class MemoryGuard:
             operation=operation,
             key=key,
             message=message,
+            source_class=source_class,
+            receipt_uri=receipt_uri,
             metadata=dict(metadata or {}),
         )
         self._events.append(event)
@@ -386,6 +660,22 @@ def _blocking_detector(verdicts: list[DetectionResult]) -> str:
 
 def _combined_message(verdicts: list[DetectionResult]) -> str:
     return "; ".join(v.message for v in verdicts if v.message)
+
+
+def _merged_metadata(verdicts: list[DetectionResult]) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    for v in verdicts:
+        if v.metadata:
+            merged.update(v.metadata)
+    return merged
+
+
+def _coerce_source_class(value: SourceClass | str | None) -> SourceClass:
+    if value is None:
+        return SourceClass.UNKNOWN
+    if isinstance(value, SourceClass):
+        return value
+    return SourceClass(str(value))
 
 
 __all__ = ["MemoryGuard", "hash_value"]

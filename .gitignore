@@ -12,3 +12,7 @@ __pycache__/
 build/
 dist/
 venv-www-project-agent-memory-guard/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
