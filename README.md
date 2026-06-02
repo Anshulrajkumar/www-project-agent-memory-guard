@@ -33,6 +33,8 @@
 [![OWASP Incubator](https://img.shields.io/badge/OWASP-Incubator-yellow.svg)](https://owasp.org/www-project-agent-memory-guard/)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/12908/badge)](https://www.bestpractices.dev/projects/12908)
 
+> **⭐ If you find this project useful for securing your AI agents, please consider giving it a star on GitHub! It helps others discover the project.**
+
 > **Stop AI agents from being weaponized through their own memory.**
 
 `agent-memory-guard` is a runtime defense layer that screens every read and write to your AI agent's memory, blocking prompt injection, secret leakage, and integrity tampering before they corrupt agent behavior across sessions.
