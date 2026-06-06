@@ -56,6 +56,24 @@ class PolicyRule:
 
 @dataclass
 class Policy:
+    """Security policy configuration for MemoryGuard operations.
+
+    A policy dictates the action to take (ALLOW, REDACT, QUARANTINE, or BLOCK)
+    when detectors match security anomalies or prompt injections. It defines key rules,
+    protected keys, and immutable baselines.
+
+    Attributes:
+        default_action: The fallback action when no rules match. Defaults to Action.ALLOW.
+        protected_keys: Glob patterns for keys protected against deletion or modification.
+        immutable_keys: Glob patterns for keys monitored with cryptographic integrity checks.
+        rules: Ordered list of rules to evaluate when scanning keys.
+        version: Policy syntax version. Defaults to 1.
+
+    Example:
+        >>> policy = Policy.strict()
+        >>> policy.decide("prompt_injection", Severity.HIGH, "session.notes")
+        <Action.BLOCK: 'block'>
+    """
     default_action: Action = Action.ALLOW
     protected_keys: tuple[str, ...] = ()
     immutable_keys: tuple[str, ...] = ()
@@ -97,6 +115,127 @@ class Policy:
         )
 
 
+    @classmethod
+    def tiered(cls) -> Policy:
+        """Pre-configured policy with key-pattern-scoped detector rules.
+
+        Maps memory-class key namespaces to detector-specific actions, so
+        e.g. a ``prompt_injection`` finding inside ``credentials.*`` is blocked
+        while the same finding inside ``facts.*`` is quarantined for review.
+
+        Key namespaces (matched as ``fnmatch`` patterns):
+        - ``credentials.*`` — block ``prompt_injection`` and ``sensitive_data``;
+          also listed in ``protected_keys``.
+        - ``permissions.*`` — block ``prompt_injection`` and ``sensitive_data``;
+          also listed in ``protected_keys``.
+        - ``policies.*`` — block ``prompt_injection``; also in ``protected_keys``.
+        - ``facts.*`` — quarantine ``prompt_injection`` and ``size_anomaly``;
+          also in ``protected_keys``.
+        - ``preferences.*`` — redact ``sensitive_data``;
+          also in ``protected_keys``.
+        - ``tool_results.*`` — block ``prompt_injection``,
+          quarantine ``size_anomaly``.
+        - ``scratch.*`` — quarantine ``size_anomaly``.
+
+        Global catch-all rules (block injection, redact secrets, block
+        protected-key writes, quarantine size/rate anomalies) run after the
+        pattern-scoped rules.
+
+        Time-to-live, revalidation, session lifetime, and actor-role gating
+        are NOT implemented here; that's a separate roadmap item.
+        """
+        return cls(
+            default_action=Action.ALLOW,
+            protected_keys=(
+                "credentials.*",
+                "permissions.*",
+                "policies.*",
+                "facts.*",
+            ),  # preferences.*, tool_results.* and scratch.* are writable by design
+            rules=[
+                # credentials.* — locked, block
+                PolicyRule(
+                    "block_credential_injection",
+                    "prompt_injection",
+                    Action.BLOCK,
+                    keys=("credentials.*",),
+                ),
+                PolicyRule(
+                    "block_credential_sensitive",
+                    "sensitive_data",
+                    Action.BLOCK,
+                    keys=("credentials.*",),
+                ),
+                # permissions.* — locked, block
+                PolicyRule(
+                    "block_permission_injection",
+                    "prompt_injection",
+                    Action.BLOCK,
+                    keys=("permissions.*",),
+                ),
+                PolicyRule(
+                    "block_permission_sensitive",
+                    "sensitive_data",
+                    Action.BLOCK,
+                    keys=("permissions.*",),
+                ),
+                # policies.* — system-only, block
+                PolicyRule(
+                    "block_policy_injection",
+                    "prompt_injection",
+                    Action.BLOCK,
+                    keys=("policies.*",),
+                ),
+                # facts.* — trusted, quarantine
+                PolicyRule(
+                    "quarantine_fact_injection",
+                    "prompt_injection",
+                    Action.QUARANTINE,
+                    keys=("facts.*",),
+                ),
+                PolicyRule(
+                    "quarantine_fact_anomaly",
+                    "size_anomaly",
+                    Action.QUARANTINE,
+                    keys=("facts.*",),
+                ),
+                # preferences.* — user-only, redact
+                PolicyRule(
+                    "redact_preference_sensitive",
+                    "sensitive_data",
+                    Action.REDACT,
+                    keys=("preferences.*",),
+                ),
+                # tool_results.* — untrusted, block + quarantine
+                PolicyRule(
+                    "block_tool_result_injection",
+                    "prompt_injection",
+                    Action.BLOCK,
+                    keys=("tool_results.*",),
+                ),
+                PolicyRule(
+                    "quarantine_tool_result_anomaly",
+                    "size_anomaly",
+                    Action.QUARANTINE,
+                    keys=("tool_results.*",),
+                ),
+                # scratch.* — ephemeral, quarantine
+                PolicyRule(
+                    "quarantine_scratch_anomaly",
+                    "size_anomaly",
+                    Action.QUARANTINE,
+                    keys=("scratch.*",),
+                ),
+                # Global catch-all rules
+                PolicyRule("block_injection", "prompt_injection", Action.BLOCK),
+                PolicyRule("redact_secrets", "sensitive_data", Action.REDACT),
+                PolicyRule("block_protected_key", "protected_key", Action.BLOCK),
+                PolicyRule("quarantine_size_anomaly", "size_anomaly", Action.QUARANTINE),
+                PolicyRule("quarantine_rapid_change", "rapid_change", Action.QUARANTINE),
+            ],
+        )
+
+
 def _parse_action(value: Any) -> Action:
     if isinstance(value, Action):
         return value
@@ -106,11 +245,12 @@ def _parse_action(value: Any) -> Action:
     return Action(text)
 
 
-def _parse_rule(raw: dict[str, Any]) -> PolicyRule:
+def _parse_rule(raw: dict[str | bool, Any]) -> PolicyRule:
     # YAML 1.1 parses unquoted `on` as the boolean True; remap it to the
     # intended string key so users can write natural policy files.
     if True in raw and "on" not in raw:
-        raw = {**raw, "on": raw[True]}
+        raw_str: dict[str | bool, Any] = {**raw, "on": raw[True]}
+        raw = raw_str
     if "name" not in raw or "action" not in raw:
         raise ValueError(f"Policy rule missing required fields: {raw!r}")
     keys = raw.get("keys") or ()
@@ -139,7 +279,23 @@ def _severity_rank(s: Severity) -> int:
 
 
 def load_policy(source: str | Path | dict[str, Any]) -> Policy:
-    """Load a policy from a YAML string, file path, or already-parsed dict."""
+    """Load a security policy from a YAML string, a file path, or a dictionary.
+
+    This function parses declarative policies that dictate the behavior of
+    MemoryGuard when checking memory operations.
+
+    Args:
+        source: The YAML policy configuration. This can be a file path (Path object),
+            a raw YAML string, or an already-parsed dictionary representation of the policy.
+
+    Returns:
+        Policy: The loaded Policy configuration instance.
+
+    Example:
+        >>> from pathlib import Path
+        >>> policy = load_policy("version: 1\\ndefault_action: allow")
+        >>> print(policy.default_action)
+    """
     if isinstance(source, dict):
         return Policy.from_dict(source)
     if isinstance(source, Path):
