@@ -33,7 +33,14 @@ class SourceType(str, Enum):
 
 
 class SourceClass(str, Enum):
-    """Internal provenance class for self-reinforcement detection."""
+    """Internal provenance class for self-reinforcement detection.
+
+    The taxonomy comes from the three-layer ASI06 architecture discussed on
+    microsoft/autogen#7683 — `external_tool` and `user_input` are external
+    inputs (untrusted by default), `agent_authored` covers an agent writing
+    back its own reasoning (the self-poisoning surface), `system` is
+    config/admin/runtime infrastructure.
+    """
     EXTERNAL_TOOL = "external_tool"
     USER_INPUT = "user_input"
     AGENT_AUTHORED = "agent_authored"
@@ -55,6 +62,7 @@ class SecurityEvent:
         source_class: Provenance of the write operation. Defaults to SourceClass.UNKNOWN.
         receipt_uri: Optional URI pointing to an external cryptographically signed audit receipt.
             Defaults to None.
+        source_type: Legacy provenance type. Defaults to SourceType.UNKNOWN.
         metadata: Arbitrary additional event metadata. Defaults to an empty dict.
         timestamp: Epoch timestamp when the event was recorded. Defaults to current time.
         event_id: Unique string identifier for this event. Defaults to a random UUID.
@@ -66,6 +74,8 @@ class SecurityEvent:
     key: str
     message: str
     operation: str = "write"
+    source_class: SourceClass = SourceClass.UNKNOWN
+    receipt_uri: str | None = None
     source_type: SourceType = SourceType.UNKNOWN
     metadata: dict[str, Any] = field(default_factory=dict)
     timestamp: float = field(default_factory=time.time)
@@ -81,6 +91,8 @@ class SecurityEvent:
             "operation": self.operation,
             "key": self.key,
             "message": self.message,
+            "source_class": self.source_class.value,
+            "receipt_uri": self.receipt_uri,
             "source_type": self.source_type.value,
             "metadata": self.metadata,
         }
