@@ -29,7 +29,7 @@ jobs:
       - name: Verify AMG import and version
         run: |
           python -c "
-import agent_memory_guard
-print(f'agent-memory-guard v{agent_memory_guard.__version__} loaded')
-print('All detection layers operational')
-"
+          import agent_memory_guard
+          print(f'agent-memory-guard v{agent_memory_guard.__version__} loaded')
+          print('All detection layers operational')
+          "
