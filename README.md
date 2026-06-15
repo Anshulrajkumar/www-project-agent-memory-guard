@@ -46,6 +46,7 @@
 
 <p align="center">
   <a href="https://colab.research.google.com/github/OWASP/www-project-agent-memory-guard/blob/main/examples/notebooks/poison_and_protect.ipynb"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab" /></a>
+  <a href="https://codespaces.new/OWASP/www-project-agent-memory-guard?quickstart=1"><img src="https://github.com/codespaces/badge.svg" alt="Open in GitHub Codespaces" height="20" /></a>
 </p>
 
 ```bash
